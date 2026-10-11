@@ -1,0 +1,443 @@
+---
+title: "PBS Utah Donor Analytics: Group Exploratory Data Analysis"
+subtitle: "Time-aware EDA for donation propensity and donor profiles"
+author: "Kayli Thompson and José Reyes Navarro"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    code-fold: false
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+set.seed(20261011)
+library(dplyr); library(ggplot2); library(knitr); library(lubridate)
+library(readr); library(scales); library(tidyr)
+theme_set(theme_minimal(base_size = 12))
+data_candidates <- c("tables", "../tables")
+data_dir <- data_candidates[dir.exists(data_candidates)][1]
+if (is.na(data_dir)) stop("Could not find the tables/ directory.")
+fiscal_year <- function(date) if_else(month(date) >= 7L, year(date) + 1L, year(date))
+pct <- label_percent(accuracy = 0.1)
+money <- label_dollar(accuracy = 1)
+```
+
+## Introduction and problem framing
+
+After the loss of federal funding, PBS Utah needs to use limited outreach capacity where it is most likely to generate donations. The project goal is an individual-level ranking of likely donors, evaluated principally with lift, plus interpretable profiles that can inform tailored outreach.
+
+**Refined analytic problem.** One record is a **person-fiscal-year opportunity**. The target, `donated`, is whether a person makes any positive PBS Utah gift during that fiscal year. The eventual supervised model should only use information known *before* the fiscal year begins; it is a classification problem, not a dollar-amount model.
+
+This EDA sharpens the original framing in two ways. First, re-identifying repeat donors is different from acquiring new donors, so evaluation must separate people with and without prior giving. Second, a missing Passport viewing row may mean no viewing, no linked account, or no consent to share data; it is not evidence of zero engagement.
+
+### Guiding questions
+
+1. What is the donation baseline by fiscal year, and how skewed are positive annual gifts?
+2. How strongly do prior-year giving and Passport activity relate to a future donation?
+3. Does campaign history add a time-safe outreach signal, and which fields would leak the target?
+4. What descriptive demographic profiles are available, and what limits their use as historical predictors?
+5. What cleaning and evaluation decisions are required before modeling or clustering?
+
+## Data inventory and analytic grain
+
+The group combined the broad source/legacy/campaign audit from one individual EDA with the time-aware donation panel from the other. Each source is read once and used at its natural grain. Payments, Passport records, and campaign membership are aggregated before joining to people, avoiding many-to-many inflation.
+
+```{r}
+#| label: read-data
+constituents_raw <- read_csv(file.path(data_dir, "constituents_w_memberships.csv"), show_col_types = FALSE)
+payments_raw <- read_csv(file.path(data_dir, "unite_payments.csv"), show_col_types = FALSE)
+soft_credits_raw <- read_csv(file.path(data_dir, "soft_credits.csv"), show_col_types = FALSE)
+viewing_raw <- read_csv(file.path(data_dir, "passport_viewing.csv"), show_col_types = FALSE)
+campaign_codes_raw <- read_csv(file.path(data_dir, "campaign_codes.csv"), show_col_types = FALSE)
+cultivation_raw <- read_csv(file.path(data_dir, "cultivation.csv"), show_col_types = FALSE)
+portfolios_raw <- read_csv(file.path(data_dir, "officer_portfolios.csv"), show_col_types = FALSE)
+legacy_raw <- read_csv(
+  file.path(data_dir, "team_approach_legacy_payments.csv"), show_col_types = FALSE,
+  col_select = c(ta_account_id, gift_date, payment_amount, gift_kind, gift_type)
+)
+
+inventory <- tibble(
+  table = c("Constituent snapshot", "Unite payments", "Soft credits", "Passport engagement",
+            "Campaign codes", "Cultivation", "Officer portfolios", "Legacy payments"),
+  rows = c(nrow(constituents_raw), nrow(payments_raw), nrow(soft_credits_raw), nrow(viewing_raw),
+           nrow(campaign_codes_raw), nrow(cultivation_raw), nrow(portfolios_raw),
+           nrow(legacy_raw)),
+  grain = c("constituent", "payment", "soft credit", "constituent-FY-genre",
+            "marketing code", "constituent-FY", "portfolio", "legacy household gift"),
+  role = c("Person universe; descriptive snapshot", "FY2021-FY2026 outcome/history",
+           "Attribution added to outcome", "Prior-year engagement features",
+           "Campaign context",
+           "Experiment diagnostic only", "Rollout context only",
+           "Historical context; allocation unresolved")
+)
+kable(inventory, caption = "Source tables, analytic grain, and role in this group EDA")
+```
+
+### Legacy-data decision
+
+Legacy payments precede FY2021 and can list multiple constituent IDs for a household gift. There are `r comma(nrow(legacy_raw))` legacy rows but only `r comma(n_distinct(legacy_raw$ta_account_id))` account IDs. Assigning a full household gift to every linked person would overstate individual giving. We retain legacy payments as historical context but do not add them to person-level outcomes or features until PBS Utah provides an allocation rule.
+
+## Data quality and modeling readiness
+
+```{r}
+#| label: quality-audit
+quality_checks <- tibble(
+  check = c("Duplicate constituent IDs", "Duplicate Unite payment IDs", "Exact duplicate Unite payments",
+            "Exact duplicate soft credits", "Orphan soft-credit recipients",
+            "Unlinked Unite donor IDs", "Organization records", "Duplicate viewing composite keys",
+    "Selected cultivation rows", "Contacted-and-holdout rows"),
+  result = c(
+    comma(sum(duplicated(constituents_raw$`Constituent ID`))),
+    comma(sum(duplicated(payments_raw$payment_id))), comma(sum(duplicated(payments_raw))),
+    comma(sum(duplicated(soft_credits_raw))),
+    comma(sum(soft_credits_raw$`Soft Credit Constituent ID` == "SYN-ORPHAN")),
+    comma(sum(!payments_raw$donor_id %in% constituents_raw$`Constituent ID`)),
+    comma(sum(constituents_raw$`Primary Constituent Type` == "Organization")),
+    comma(sum(duplicated(viewing_raw |> select(constituent_id, fiscal_year, genre)))),
+    comma(sum(cultivation_raw$selected)),
+    comma(sum(cultivation_raw$contacted & cultivation_raw$holdout))
+  ),
+  decision = c(
+    "No action", "No action", "No action", "Remove before aggregation",
+    "Exclude: no person key", "Exclude: no person key", "Exclude from individual universe",
+    "Aggregate to person-year", "Do not use selection as a feature",
+    "Expected mutually exclusive groups"
+  )
+)
+kable(quality_checks, caption = "Quality checks and handling decisions")
+
+missingness <- constituents_raw |>
+  summarise(across(everything(), ~ mean(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "field", values_to = "missing_share") |>
+  filter(missing_share > 0) |>
+  arrange(desc(missing_share)) |>
+  mutate(missing_share = pct(missing_share))
+kable(missingness, col.names = c("Constituent snapshot field", "Missing share"),
+      caption = "Nonzero missingness in the constituent snapshot")
+```
+
+Missingness is structural, not a reason to broadly impute. Degree and employment fields are blank in this release, while spouse, marital-status, and major-donor fields are sparse. They should be excluded or encoded as an explicit “unknown/not recorded” category only after production availability is verified. Campaign membership has no documented unique key, and its target-year response fields are derived from payment; it is therefore deferred from the prediction panel pending a separate contact-timing design.
+
+Age, gender, sustainer status, and major-donor class are release-end snapshots. They can describe profiles, but cannot safely predict historical outcomes without dated versions. Similarly, target-year `responded` is derived from target-year payment and is excluded as leakage.
+
+## Historical giving and outreach context
+
+### How does the legacy giving record complement the current-payment history?
+
+```{r}
+#| label: legacy-context
+legacy_by_year <- legacy_raw |>
+  mutate(fiscal_year = fiscal_year(gift_date)) |>
+  group_by(fiscal_year) |>
+  summarise(
+    payment_rows = n(),
+    households = n_distinct(ta_account_id),
+    total_recorded_giving = sum(payment_amount),
+    median_payment = median(payment_amount),
+    .groups = "drop"
+  )
+
+kable(
+  legacy_by_year |> filter(fiscal_year >= 2015) |>
+    mutate(across(c(total_recorded_giving, median_payment), money)),
+  caption = "Legacy-payment context before the FY2021 Unite payment period"
+)
+
+ggplot(filter(legacy_by_year, fiscal_year >= 2010),
+       aes(fiscal_year, total_recorded_giving)) +
+  geom_line(linewidth = 0.8, color = "#2C7FB8") +
+  geom_point(color = "#2C7FB8") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Recorded legacy giving grew in the years immediately before FY2021",
+    subtitle = "Household/legacy payment records; not allocated to individual people",
+    x = "Fiscal year", y = "Total recorded payment amount"
+  )
+```
+
+The legacy system provides a long history, including `r comma(sum(legacy_raw$gift_kind == "Sustaining"))` sustaining and `r comma(sum(legacy_raw$gift_kind == "One-Time"))` one-time records. Its aggregate trend is useful context for PBS Utah's historical fundraising base, but the multiple-person household links prevent us from treating those totals as individual-level model features. This is a data-integration requirement for the modeling phase, not a reason to discard the history.
+
+### What outreach channels exist in the campaign-code portfolio?
+
+```{r}
+#| label: campaign-portfolio
+campaign_channel_summary <- campaign_codes_raw |>
+  count(`Communication Method`, sort = TRUE, name = "marketing_codes") |>
+  mutate(share = marketing_codes / sum(marketing_codes))
+
+kable(
+  campaign_channel_summary |> mutate(share = pct(share)),
+  col.names = c("Communication method", "Marketing codes", "Share of codes"),
+  caption = "Campaign-code portfolio by documented communication method"
+)
+
+ggplot(campaign_channel_summary,
+       aes(reorder(`Communication Method`, marketing_codes), marketing_codes)) +
+  geom_col(fill = "#DD8D00") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Legacy and miscellaneous channels dominate the campaign-code portfolio",
+    x = NULL, y = "Number of marketing codes"
+  )
+```
+
+This table describes available marketing codes, not the causal effectiveness of each channel or the number of people contacted. It suggests that any later campaign analysis should avoid collapsing the many legacy/miscellaneous codes into a single behavioral interpretation. In particular, campaign-membership response remains excluded from the prediction target because it is derived from same-year payment activity.
+
+## Shared time-aware person-year panel
+
+Positive FY giving combines linked positive Unite payments and linked positive soft credits after exact duplicate removal. The two organization records and unlinked payment/soft-credit records are excluded because the business problem is about people. A payment of zero is not a donation.
+
+```{r}
+#| label: build-panel
+people <- constituents_raw |>
+  transmute(
+    id = `Constituent ID`, age_snapshot = Age, gender_snapshot = Gender,
+    state_snapshot = `Address State`, marital_status_snapshot = `Marital Status`,
+    constituent_type = `Primary Constituent Type`, sustainer_snapshot = `Sustainer PBS Utah`,
+    major_donor_class_snapshot = `Major Donor Class PBS Utah`
+  ) |>
+  filter(constituent_type != "Organization")
+
+payments <- payments_raw |> mutate(fiscal_year = fiscal_year(credit_date))
+soft_credits <- soft_credits_raw |>
+  distinct() |>
+  filter(`Soft Credit Constituent ID` != "SYN-ORPHAN") |>
+  transmute(id = `Soft Credit Constituent ID`, fiscal_year = fiscal_year(`Credit Date`), amount = `Credit Amount`)
+
+giving_by_year <- bind_rows(
+  payments |> filter(payment_amount > 0, donor_id %in% people$id) |>
+    transmute(id = donor_id, fiscal_year, amount = payment_amount),
+  soft_credits |> filter(amount > 0)
+) |>
+  group_by(id, fiscal_year) |>
+  summarise(giving = sum(amount), .groups = "drop")
+
+viewing_by_year <- viewing_raw |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(total_titles_viewed = sum(titles_viewed), genres_viewed = n_distinct(genre),
+            mean_completion = weighted.mean(mean_percent_watched, w = titles_viewed), .groups = "drop") |>
+  rename(id = constituent_id)
+
+# A payment's marketing code is transaction metadata. Its *prior-year* count is
+# safe to investigate, unlike target-year campaign response.
+payment_campaign_by_year <- payments |>
+  filter(payment_amount > 0, donor_id %in% people$id) |>
+  group_by(id = donor_id, fiscal_year) |>
+  summarise(prior_paid_campaigns = n_distinct(marketing_code), .groups = "drop")
+
+donor_panel <- crossing(id = people$id, fiscal_year = 2021:2026) |>
+  left_join(giving_by_year |> rename(target_fy = fiscal_year, target_giving = giving),
+            by = c("id", "fiscal_year" = "target_fy")) |>
+  mutate(target_giving = coalesce(target_giving, 0), donated = target_giving > 0) |>
+  left_join(giving_by_year |> transmute(id, fiscal_year = fiscal_year + 1L, prior_giving = giving),
+            by = c("id", "fiscal_year")) |>
+  left_join(viewing_by_year |> transmute(id, fiscal_year = fiscal_year + 1L,
+    prior_titles = total_titles_viewed, prior_genres = genres_viewed, prior_mean_completion = mean_completion),
+    by = c("id", "fiscal_year")) |>
+  left_join(payment_campaign_by_year |> transmute(
+    id, fiscal_year = fiscal_year + 1L, prior_paid_campaigns
+  ), by = c("id", "fiscal_year")) |>
+  mutate(
+    across(c(prior_giving, prior_titles, prior_genres, prior_mean_completion,
+             prior_paid_campaigns), ~ coalesce(.x, 0)),
+    had_prior_gift = prior_giving > 0, had_prior_viewing = prior_titles > 0
+  ) |>
+  left_join(people, by = "id")
+```
+
+## Target prevalence and annual-gift distribution
+
+### Q1. What is the baseline for a useful ranking?
+
+```{r}
+#| label: target-by-year
+year_summary <- donor_panel |>
+  group_by(fiscal_year) |>
+  summarise(people = n(), donors = sum(donated), donation_rate = mean(donated), .groups = "drop")
+kable(year_summary |> mutate(donation_rate = pct(donation_rate)),
+      col.names = c("Fiscal year", "People", "Donors", "Donation rate"),
+      caption = "Donation baseline in the person-year universe")
+
+ggplot(year_summary, aes(factor(fiscal_year), donation_rate)) +
+  geom_col(fill = "#2C7FB8") +
+  geom_text(aes(label = pct(donation_rate)), vjust = -0.35) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, .25)) +
+  labs(title = "A positive gift occurs for roughly one in six people each year",
+       x = "Fiscal year", y = "Share with positive giving")
+```
+
+The target rate ranges from `r pct(min(year_summary$donation_rate))` to `r pct(max(year_summary$donation_rate))`. A 2x-lift result must deliver at least twice the relevant fiscal-year baseline in the selected group; accuracy alone would be misleading because non-donation is the majority outcome. The FY2026 change is descriptive only--synthetic data cannot establish a post-funding causal effect.
+
+```{r}
+#| label: gift-distribution
+gift_summary <- donor_panel |> filter(donated) |>
+  summarise(n_donor_years = n(), median_gift = median(target_giving), mean_gift = mean(target_giving),
+            p90 = quantile(target_giving, .90), p99 = quantile(target_giving, .99), maximum = max(target_giving))
+kable(gift_summary |> mutate(across(-n_donor_years, money)), caption = "Positive annual-giving distribution")
+
+ggplot(filter(donor_panel, donated), aes(target_giving)) +
+  geom_histogram(binwidth = .12, fill = "#41AB5D", color = "white") +
+  scale_x_log10(labels = dollar_format()) +
+  labs(title = "Annual giving has a long right tail", subtitle = "Logarithmic x-axis",
+       x = "Positive annual giving", y = "Donor fiscal years")
+```
+
+The median positive annual gift is `r money(gift_summary$median_gift)`, compared with a mean of `r money(gift_summary$mean_gift)` and maximum of `r money(gift_summary$maximum)`. A small number of high gifts drive the tail, supporting donation likelihood as the first modeling target and capped/logged dollars for later profiles.
+
+## Time-safe relationships with the target
+
+### Q2. Does prior giving dominate future donation likelihood?
+
+```{r}
+#| label: prior-giving
+prior_giving_summary <- donor_panel |>
+  mutate(prior_giving_band = case_when(
+    prior_giving == 0 ~ "$0", prior_giving <= 50 ~ "$1-$50", prior_giving <= 250 ~ "$51-$250",
+    prior_giving <= 1000 ~ "$251-$1,000", TRUE ~ "$1,000+"
+  ), prior_giving_band = factor(prior_giving_band,
+    levels = c("$0", "$1-$50", "$51-$250", "$251-$1,000", "$1,000+"))) |>
+  group_by(prior_giving_band) |>
+  summarise(person_years = n(), donation_rate = mean(donated), .groups = "drop")
+kable(prior_giving_summary |> mutate(donation_rate = pct(donation_rate)),
+      col.names = c("Prior FY giving", "Person-years", "Target-year donation rate"),
+      caption = "Future donation by prior-year giving")
+
+ggplot(prior_giving_summary, aes(prior_giving_band, donation_rate)) +
+  geom_col(fill = "#756BB1") +
+  geom_text(aes(label = pct(donation_rate)), vjust = -0.35) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(title = "Prior giving is the clearest time-safe signal", x = "Prior FY giving",
+       y = "Target-year donation rate")
+```
+
+People with no prior-year giving donate at `r pct(prior_giving_summary$donation_rate[1])`, versus `r pct(max(prior_giving_summary$donation_rate))` in the highest giving band. Prior giving is the essential benchmark, but final lift must also be reported in the no-prior-gift subgroup so retention performance is not mistaken for acquisition performance.
+
+### Q3. Is Passport viewing a stand-alone acquisition signal?
+
+```{r}
+#| label: giving-viewing
+engagement_summary <- donor_panel |>
+  mutate(segment = case_when(
+    had_prior_gift & had_prior_viewing ~ "Prior giver and viewer", had_prior_gift ~ "Prior giver only",
+    had_prior_viewing ~ "Viewer only", TRUE ~ "Neither"
+  ), segment = factor(segment, levels = c("Neither", "Viewer only", "Prior giver only", "Prior giver and viewer"))) |>
+  group_by(segment) |>
+  summarise(person_years = n(), donation_rate = mean(donated), .groups = "drop")
+kable(engagement_summary |> mutate(donation_rate = pct(donation_rate)),
+      col.names = c("Prior-year segment", "Person-years", "Target-year donation rate"),
+      caption = "Future donation by prior giving and Passport viewing")
+
+ggplot(engagement_summary, aes(segment, donation_rate, fill = segment)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = pct(donation_rate)), vjust = -0.35) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, .9)) +
+  labs(title = "Viewing alone does not identify high-propensity new donors", x = NULL,
+       y = "Target-year donation rate") +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+The viewer-only group donates at `r pct(engagement_summary$donation_rate[engagement_summary$segment == "Viewer only"])`, below the `r pct(engagement_summary$donation_rate[engagement_summary$segment == "Neither"])` rate for people with neither signal. Viewing should be tested as an incremental feature alongside giving history, not presumed to be a stand-alone acquisition channel. A missing viewing row needs an availability indicator rather than an assumed zero.
+
+### Q4. What does prior paid marketing-code history add?
+
+```{r}
+#| label: prior-campaign
+campaign_summary <- donor_panel |>
+  mutate(prior_campaign_band = case_when(
+    prior_paid_campaigns == 0 ~ "0", prior_paid_campaigns == 1 ~ "1",
+    prior_paid_campaigns == 2 ~ "2", TRUE ~ "3+"
+  ), prior_campaign_band = factor(prior_campaign_band, levels = c("0", "1", "2", "3+"))) |>
+  group_by(prior_campaign_band) |>
+  summarise(person_years = n(), donation_rate = mean(donated), .groups = "drop")
+kable(campaign_summary |> mutate(donation_rate = pct(donation_rate)),
+      col.names = c("Prior FY paid marketing codes", "Person-years", "Target-year donation rate"),
+      caption = "Future donation by prior-year paid marketing-code diversity")
+
+ggplot(campaign_summary, aes(prior_campaign_band, donation_rate)) +
+  geom_col(fill = "#DD8D00") +
+  geom_text(aes(label = pct(donation_rate)), vjust = -0.35) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(title = "Past paid marketing-code diversity is a candidate history feature",
+       x = "Distinct codes on prior FY payments", y = "Target-year donation rate")
+```
+
+Past paid marketing-code diversity describes historical donor behavior, not causal campaign effectiveness. It can be tested alongside prior giving, but may add little after recency and amount are known. The full campaign-members table remains valuable for an experiment-design audit; its target-year `responded`, `response_type`, and `responded_date` must be excluded from prediction because response is derived from same-year payment and the latter fields are less reliable.
+
+### Q5. What descriptive profiles are visible in the snapshot?
+
+```{r}
+#| label: demographics
+demographic_summary <- donor_panel |>
+  filter(!is.na(age_snapshot), !is.na(gender_snapshot)) |>
+  mutate(age_band = cut(age_snapshot, breaks = c(0, 39, 54, 64, 74, Inf),
+                        labels = c("<40", "40-54", "55-64", "65-74", "75+"))) |>
+  group_by(age_band) |>
+  summarise(person_years = n(), donation_rate = mean(donated),
+            median_positive_giving = median(target_giving[target_giving > 0]), .groups = "drop")
+kable(demographic_summary |> mutate(donation_rate = pct(donation_rate),
+                                    median_positive_giving = money(median_positive_giving)),
+      col.names = c("Snapshot age band", "Person-years", "Donation rate", "Median positive giving"),
+      caption = "Descriptive relationship by release-end age snapshot")
+
+ggplot(demographic_summary, aes(age_band, donation_rate)) +
+  geom_col(fill = "#1B9E77") +
+  geom_text(aes(label = pct(donation_rate)), vjust = -0.35) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, .3)) +
+  labs(title = "Age groups provide profile context, not time-safe evidence",
+       x = "Release-end age band", y = "Target-year donation rate")
+
+gender_summary <- donor_panel |>
+  filter(!is.na(gender_snapshot)) |>
+  group_by(gender_snapshot) |>
+  summarise(
+    person_years = n(),
+    donation_rate = mean(donated),
+    median_positive_giving = median(target_giving[target_giving > 0]),
+    .groups = "drop"
+  )
+kable(
+  gender_summary |> mutate(
+    donation_rate = pct(donation_rate),
+    median_positive_giving = money(median_positive_giving)
+  ),
+  col.names = c("Snapshot gender", "Person-years", "Donation rate", "Median positive giving"),
+  caption = "Descriptive relationship by release-end gender snapshot"
+)
+```
+
+These demographic patterns support descriptive communication profiles, not retrospective causal claims: snapshot values describe people at the end of the release, after many target years have occurred. The age results are similar across bands, while the gender summary should be read especially carefully because “Unknown” is a data-recording category rather than an identity group. Before using any snapshot attribute in a deployment model, PBS Utah must provide dated snapshots or verify that each field is available unchanged at scoring time. Gender, marital status, and geography also require an explicit fairness and appropriateness review before ranking use.
+
+## Synthesis: implications for modeling and outreach
+
+1. Build a chronological person-year classifier using only pre-target information. Exclude target-year payments, responses, cultivation contact/selection, and end-of-release snapshot labels with unknown timing.
+2. Compare every model with a prior-giving baseline. Report decile lift overall **and** within people with no prior gift.
+3. Test Passport and transaction-marketing measures as incremental features, not causal levers. Use prior titles, genre diversity, completion, and paid marketing-code history only after a temporal split.
+4. For clustering, use interpretable time-safe recency/frequency/monetary and viewing features. Cap or log-transform dollars, assess cluster stability, and keep only profiles PBS Utah can act on.
+5. Preserve cultivation holdouts for outreach evaluation. Cultivation is selected-only and nearly all selected people give, so it must not train the propensity model. If randomization/contact timing are confirmed, compare model-selected outreach with holdout/current practice to estimate incremental impact.
+
+## Reproducibility, transparency, and contributions
+
+This is one coherent notebook: it loads each source once, builds one shared person-year panel, leaves cleaning and analysis code visible, and suppresses lengthy raw previews. It runs from a clean R session using relative paths. Required packages are `dplyr`, `ggplot2`, `knitr`, `lubridate`, `readr`, `scales`, and `tidyr`.
+
+Render from the project root:
+
+```bash
+quarto render analysis/pbs_utah_group_eda.qmd
+```
+
+**Synthetic-data note.** All supplied records and identifiers are synthetic. Findings are instructional only and cannot be used for real PBS Utah outreach.
+
+**AI-use note.** Kayli used GitHub Copilot for reviewed code suggestions supporting source auditing, transformation, and visualization. José used OpenAI Codex to inspect supplied synthetic dictionaries/files, draft and verify reproducible R code, and consolidate the notebooks. The team reviewed the code and findings, made the analytic decisions, and should re-run the rendered notebook before submission. No real donor data or PII was shared with any AI tool.
+
+**Group-member contributions.** Kayli contributed the source inventory, legacy-payment/soft-credit review, campaign and demographic exploration, and initial AI-use documentation. José contributed the time-aware target, duplicate/orphan handling, prior-giving and Passport analyses, leakage safeguards, evaluation plan, and final synthesis. Both members reviewed the integrated narrative and outputs.
