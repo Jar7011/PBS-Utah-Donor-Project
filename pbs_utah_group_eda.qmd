@@ -36,9 +36,9 @@ money <- label_dollar(accuracy = 1)
 
 After the loss of federal funding, PBS Utah needs to use limited outreach capacity where it is most likely to generate donations. The project goal is an individual-level ranking of likely donors, evaluated principally with lift, plus interpretable profiles that can inform tailored outreach.
 
-**Refined analytic problem.** One record is a **person-fiscal-year opportunity**. The target, `donated`, is whether a person makes any positive PBS Utah gift during that fiscal year. The eventual supervised model should only use information known *before* the fiscal year begins; it is a classification problem, not a dollar-amount model.
+**Refined analytic problem.** One record is a **person-fiscal-year opportunity**. The target, `donated`, is whether a person makes any positive PBS Utah gift during that fiscal year. The unit of analysis is an individual constituent. The eventual supervised model should only use information known *before* the fiscal year begins; it is a classification problem, not a dollar-amount model.
 
-This EDA sharpens the original framing in two ways. First, re-identifying repeat donors is different from acquiring new donors, so evaluation must separate people with and without prior giving. Second, a missing Passport viewing row may mean no viewing, no linked account, or no consent to share data; it is not evidence of zero engagement.
+This EDA sharpens the original framing in three ways. First, re-identifying repeat donors is different from acquiring new donors, so evaluation must separate people with and without prior giving. Second, a missing Passport viewing row may mean no viewing, no linked account, or no consent to share data; it is not evidence of zero engagement. Finally, we reached the understanding that the vast majority of the data is from constituents who have not donated to PBS Utah or have reached mid/major donor status. This shows the importance of focusing in on what sets the donors apart from the rest of PBS viewers.
 
 ### Guiding questions
 
@@ -50,20 +50,68 @@ This EDA sharpens the original framing in two ways. First, re-identifying repeat
 
 ## Data inventory and analytic grain
 
-The group combined the broad source/legacy/campaign audit from one individual EDA with the time-aware donation panel from the other. Each source is read once and used at its natural grain. Payments, Passport records, and campaign membership are aggregated before joining to people, avoiding many-to-many inflation.
+The group combined the broad source/legacy/campaign audit from one individual EDA with the time-aware donation panel from the other. Each source is read once and used at its natural grain. Payments and Passport records are aggregated before joining to people, avoiding many-to-many inflation.
 
 ```{r}
 #| label: read-data
-constituents_raw <- read_csv(file.path(data_dir, "constituents_w_memberships.csv"), show_col_types = FALSE)
-payments_raw <- read_csv(file.path(data_dir, "unite_payments.csv"), show_col_types = FALSE)
-soft_credits_raw <- read_csv(file.path(data_dir, "soft_credits.csv"), show_col_types = FALSE)
-viewing_raw <- read_csv(file.path(data_dir, "passport_viewing.csv"), show_col_types = FALSE)
-campaign_codes_raw <- read_csv(file.path(data_dir, "campaign_codes.csv"), show_col_types = FALSE)
-cultivation_raw <- read_csv(file.path(data_dir, "cultivation.csv"), show_col_types = FALSE)
-portfolios_raw <- read_csv(file.path(data_dir, "officer_portfolios.csv"), show_col_types = FALSE)
-legacy_raw <- read_csv(
-  file.path(data_dir, "team_approach_legacy_payments.csv"), show_col_types = FALSE,
-  col_select = c(ta_account_id, gift_date, payment_amount, gift_kind, gift_type)
+# The larger project files are stored with Git LFS. The raw GitHub URL can
+# return an LFS pointer instead of CSV data, so try its media URL as a fallback.
+source_paths <- c(
+  constituents_w_memberships = "tables/constituents_w_memberships.csv",
+  unite_payments = "tables/unite_payments.csv",
+  team_approach_legacy_payments = "tables/team_approach_legacy_payments.csv",
+  passport_viewing = "tables/passport_viewing.csv",
+  cultivation = "tables/cultivation.csv",
+  campaign_codes = "tables/campaign_codes.csv",
+  officer_portfolios = "tables/officer_portfolios.csv",
+  soft_credits = "tables/soft_credits.csv"
+)
+
+resolve_csv_url <- function(path) {
+  urls <- c(
+    paste0("https://raw.githubusercontent.com/jefftwebb/donor_prediction_capstone_project/main/", path),
+    paste0("https://media.githubusercontent.com/media/jefftwebb/donor_prediction_capstone_project/main/", path)
+  )
+
+  for (url in urls) {
+    header <- tryCatch(read_lines(url, n_max = 1, progress = FALSE), error = function(e) character())
+    is_lfs_pointer <- length(header) > 0 && grepl("^version https://git-lfs.github.com/spec/v1$", header[1])
+    if (length(header) > 0 && !is_lfs_pointer) return(url)
+  }
+  NA_character_
+}
+
+resolved_urls <- tibble(
+  dataset = names(source_paths),
+  path = unname(source_paths),
+  url = vapply(unname(source_paths), resolve_csv_url, character(1))
+)
+
+read_dataset <- function(dataset_name, ...) {
+  url <- resolved_urls$url[resolved_urls$dataset == dataset_name]
+  if (length(url) != 1 || is.na(url)) {
+    stop("No usable GitHub CSV URL found for: ", dataset_name)
+  }
+  read_csv(url, show_col_types = FALSE, ...)
+}
+
+constituents_raw <- read_dataset("constituents_w_memberships")
+payments_raw <- read_dataset("unite_payments")
+soft_credits_raw <- read_dataset("soft_credits")
+viewing_raw <- read_dataset("passport_viewing")
+campaign_codes_raw <- read_dataset("campaign_codes")
+cultivation_raw <- read_dataset("cultivation")
+portfolios_raw <- read_dataset("officer_portfolios")
+
+legacy_raw <- read_dataset(
+  "team_approach_legacy_payments",
+  col_select = c(
+    ta_account_id,
+    gift_date,
+    payment_amount,
+    gift_kind,
+    gift_type
+  )
 )
 
 inventory <- tibble(
@@ -194,7 +242,7 @@ ggplot(campaign_channel_summary,
 
 This table describes available marketing codes, not the causal effectiveness of each channel or the number of people contacted. It suggests that any later campaign analysis should avoid collapsing the many legacy/miscellaneous codes into a single behavioral interpretation. In particular, campaign-membership response remains excluded from the prediction target because it is derived from same-year payment activity.
 
-## Shared time-aware person-year panel
+## Cleaned Dataframe Creation for Further EDA
 
 Positive FY giving combines linked positive Unite payments and linked positive soft credits after exact duplicate removal. The two organization records and unlinked payment/soft-credit records are excluded because the business problem is about people. A payment of zero is not a donation.
 
@@ -438,6 +486,6 @@ quarto render analysis/pbs_utah_group_eda.qmd
 
 **Synthetic-data note.** All supplied records and identifiers are synthetic. Findings are instructional only and cannot be used for real PBS Utah outreach.
 
-**AI-use note.** Kayli used GitHub Copilot for reviewed code suggestions supporting source auditing, transformation, and visualization. José used OpenAI Codex to inspect supplied synthetic dictionaries/files, draft and verify reproducible R code, and consolidate the notebooks. The team reviewed the code and findings, made the analytic decisions, and should re-run the rendered notebook before submission. No real donor data or PII was shared with any AI tool.
+**AI-use note.** Kayli used GitHub Copilot for reviewed code suggestions supporting source auditing, transformation, and visualization. José used OpenAI Codex to inspect supplied synthetic dictionaries/files, draft and verify reproducible R code, and consolidate the notebooks. The team reviewed the code and findings and made the analytic decisions. No real donor data or PII was shared with any AI tool.
 
 **Group-member contributions.** Kayli contributed the source inventory, legacy-payment/soft-credit review, campaign and demographic exploration, and initial AI-use documentation. José contributed the time-aware target, duplicate/orphan handling, prior-giving and Passport analyses, leakage safeguards, evaluation plan, and final synthesis. Both members reviewed the integrated narrative and outputs.
